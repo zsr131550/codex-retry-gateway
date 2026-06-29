@@ -1,5 +1,68 @@
 # err.md
 
+## 2026-06-28 长上下文主动探针从词数近似升级为 token 预算硬探针
+
+### 现象
+
+- 旧版 `long_context` 只按 `target_word_count` 构造重复文本
+- 虽然能大致撞进 `>400K` 区间，但不能证明请求真的按目标模型口径到达了目标 token 预算
+
+### 根因
+
+- 上游当前不兼容官方 `responses/input_tokens` 计数接口
+- 旧实现只能用词数近似，证据强度不够
+
+### 处理
+
+- 长上下文探针配置改为 `long_context.target_input_tokens`
+- 探针先发送小样本校准请求，读取同一目标模型返回的 `usage.input_tokens`
+- 再按真实返回口径估算并构造预算请求
+- 样本与日志里落盘：
+  - `target_input_tokens`
+  - `observed_input_tokens`
+  - `estimated_input_tokens`
+  - `budget_source=response_usage`
+
+### 验证
+
+- 仓库回归：
+  - `node .\scripts\test-gateway-e2e.mjs` 通过
+- UI 文案回归：
+  - “模型家族一致性” 改为 “模型家族一致性（被动探针）”
+
+## 2026-06-28 主动探针图片输入误报 502 / transport_error
+
+### 现象
+
+- 主动探针里的 `image_input` 在真实上游上持续返回：
+  - `502`
+  - `transport_error` 或 `indeterminate`
+- 但同一时段：
+  - `long_context` 可以 `200 pass`
+  - 用户手工实测 `gpt-5.4` / `gpt-5.5` 图片能力正常
+
+### 根因
+
+- 探针图片使用的是 `data:image/svg+xml;base64,...`
+- 当前兼容链路对 `SVG data URL` 处理不稳定，真实现象会表现为上游拒绝、超时或被转写成 `502`
+- 官方文档列出的常见视觉输入类型是 `png / jpg / gif / webp`，不包含 `svg`
+
+### 处理
+
+- 将主动探针内置图片从 `SVG data URL` 改为光栅 `PNG data URL`
+- 保持探针请求结构不变，只替换图片 MIME 类型与内容
+- 在 E2E 假上游里增加一条约束：
+  - 若图片探针仍发送 `data:image/svg+xml`，则模拟上游异常
+  - 这样可以防止后续回归把 `SVG` 又带回来
+
+### 验证
+
+- 仓库回归：
+  - `node .\scripts\test-gateway-e2e.mjs` 通过
+- 本机真实验证：
+  - `gpt-5.5 image_input`：`200 pass`，证据为 `A`
+  - `gpt-5.4 image_input`：`200 pass`，证据为 `A`
+
 ## 2026-06-26 独立 Codex Retry Gateway
 
 ### 设计边界
@@ -326,6 +389,174 @@
        - 新增“网关重启后实时日志应重新全量加载并显示本地时间”断言
        - 新增“网关重启后不应继续保留上一次会话的旧日志”断言
        - 新增“检测到网关重启后应全量重拉日志”断言
+
+25. 新增主动探针运行层，并与普通代理统计完全隔离
+   - 目标：
+     - 在不干扰 `proxyRequest()` 主链路的前提下，低频主动验证 `gpt-5.4` / `gpt-5.5` 声明契约
+   - 处理：
+     - 在 `gateway.mjs` 内新增 `active_probe` 配置和独立 `probeMonitor`
+     - 新增主动探针状态快照 `active_probe`
+     - 新增低频定时调度，不进入普通代理请求统计
+   - 当前范围：
+     - 长上下文硬契约探针
+     - `gpt-5.5` 图片输入硬契约探针
+     - 响应结构辅助探针
+     - 身份一致性辅助探针
+     - 训练截止日期 / 知识表现辅助探针
+   - 边界：
+     - 只做声明证伪，不做真实底层模型归因
+     - 辅助探针默认只产出 `warning`
+     - `transport_error` 不计入违约
+   - 验证：
+     - `scripts/test-gateway-e2e.mjs`
+       - 新增 probe-only gateway 的 `violation` 断言
+       - 新增 probe-only gateway 的 `warning` 断言
+       - 新增“主动探针不应污染普通代理统计”断言
+
+26. 管理页新增“主动探针”面板，并展示独立样本与日志证据
+   - 现象：
+     - 之前状态接口已有 `active_probe`，但管理页没有对应展示区域
+   - 处理：
+     - 新增主动探针概览卡片：
+       - 状态
+       - 最近目标模型
+       - 最近一次运行
+       - 通过 / warning / 违约 / transport error 次数
+     - 新增最近主动探针样本表与日志证据
+   - 验证：
+     - `scripts/test-gateway-e2e.mjs`
+       - 新增“主动探针状态未正确展示”相关 UI 断言
+     - `scripts/test-install-restore.mjs`
+       - 新增管理页包含“主动探针”与状态接口暴露 `active_probe` 断言
+
+27. 管理页模板字符串里直接写反引号文案会让 gateway 启动即崩
+   - 现象：
+     - 新增“主动探针”说明文案后，`/__codex_retry_gateway/health` 超时
+     - `node --check gateway.mjs` 报：
+       - `SyntaxError: Unexpected identifier 'warning'`
+   - 根因：
+     - 管理页 HTML 本身位于 JS 模板字符串中
+     - 文案里直接写了反引号包裹的 `warning` / `violation` / `transport_error`
+     - 导致模板字符串被提前截断
+   - 处理：
+     - 把该段文案改成普通文本，不再在模板字符串里直接嵌反引号
+   - 验证：
+     - `node --check .\\gateway.mjs`
+     - `node .\\scripts\\test-gateway-e2e.mjs`
+
+28. 真实上游的长上下文主动探针使用大量唯一编号词，会把请求体打得过碎，导致探针极慢甚至先拿到 `502`
+   - 现象：
+     - 假上游 E2E 全绿
+     - 但真实 `ai.input.im` 上，`gpt-5.4` 长上下文探针可能耗时接近 100 秒，甚至返回 `502`
+     - 同一条探针改成高密度重复词后，可在几秒内正常返回 `200`
+   - 根因：
+     - 旧版 `buildLongContextProbeText()` 生成的是 `w000001`、`w000002` 这类大量唯一词
+     - 真实上游在分词/前置服务处理这种超高基数输入时，负担远大于“相同 token 重复”的正常长上下文场景
+     - 结果把本应用来验证 400K/900K 契约的探针，先打成了“上游服务暂时不可用”
+   - 处理：
+     - 长上下文探针改为高密度重复 `a` token
+     - 仍保持总量超过 400K 级别，但避免因为输入构造方式本身制造伪 `502`
+   - 验证：
+     - `node .\\scripts\\test-gateway-e2e.mjs`
+     - 真实本机路由 `POST /__codex_retry_gateway/api/probe/run`
+       - `gpt-5.4 long_context` 从慢速 `502` 变为快速 `200 pass`
+
+29. 主动探针样本之前只保留了 `start` 日志，且 `401/502` 这类上游错误摘要没有落进样本
+   - 现象：
+     - 管理页“最近主动探针样本”里的“查看”经常只能看到开始日志
+     - `401`、`502 upstream_error` 等真实证据没有保留下来
+     - `现在探测一次` 还会一直等待整轮探针跑完，真实上游慢时很像按钮卡死
+   - 根因：
+     - `collectProbeEvidenceLogs()` 在结果日志写入前就被调用
+     - `error_excerpt` 只记录 `requestError`，不会从 HTTP 错误响应体提取摘要
+     - `/api/probe/run` 同步等待 `safeRunActiveProbeOnce()` 全部完成后才返回
+   - 处理：
+     - 为主动探针样本补充：
+       - `finish ... status=... result=... confidence=...`
+       - `detail=...` 错误摘要
+     - `error_excerpt` 改为优先保留响应体里的 `error.type/code/message` 或文本摘要
+     - `/api/probe/run` 改为后台启动探针，立即返回 `202`
+   - 验证：
+     - `node .\\scripts\\test-gateway-e2e.mjs`
+     - `powershell -ExecutionPolicy Bypass -File .\\scripts\\test-install-restore.ps1`
+     - 真实本机路由状态接口：
+      - `image_input` 样本可见 `upstream_error | Upstream access forbidden, please contact administrator`
+      - `gpt-5.5 long_context` 样本可见 `upstream_error | Upstream service temporarily unavailable`
+
+30. 流式 / 非流式拦截目标拆分后，命中统计不能等同于实际拦截统计
+   - 现象：
+     - 用户需要三种模式：
+       - 仅拦流式
+       - 仅拦非流式
+       - 流式 + 非流式都拦
+     - 如果只用旧的 `matched_response_count`，页面无法区分“命中了但当前配置只观察”和“命中了并实际拦截”
+   - 根因：
+     - 旧配置只有 `stream_action` 与 `non_stream_status_code`
+     - 旧统计只有规则命中总数，没有按流式 / 非流式拆分，也没有 blocked 统计
+     - 非流式命中被拦截时如果提前返回，模型一致性收口会漏掉这批响应
+   - 处理：
+     - 新增配置：
+       - `intercept_streaming`
+       - `intercept_non_streaming`
+     - 默认双开，保持旧行为兼容
+     - 后端和管理页都禁止两个开关同时关闭
+     - 新增统计：
+       - `matched_streaming_count`
+       - `matched_non_streaming_count`
+       - `blocked_response_count`
+       - `blocked_streaming_count`
+       - `blocked_non_streaming_count`
+     - `matched_response_count` 继续表示规则命中次数，不改成实际拦截次数
+     - 命中但未拦截时日志写 `action=observe_only`
+     - 非流式命中无论拦截还是透传，都进入 `finalizeModelInsights()`
+   - 验证：
+     - `node .\scripts\test-gateway-e2e.mjs`
+     - `node .\scripts\test-install-restore.mjs`
+     - `node --check .\gateway.mjs`
+     - `git diff --check`
+
+31. 上游 API 不可用时不应刷网关内部错误堆栈
+   - 现象：
+     - 日志反复出现：
+       - `[retry] upstream fetch failed attempt=1 ...`
+       - `[error] TypeError: fetch failed`
+     - 用户确认这类报错来自上游 API 异常，不是 gateway 自身逻辑崩溃
+   - 根因：
+     - 统一 catch 把重试后仍失败的上游 `fetch failed` 当成普通 gateway 内部错误记录
+     - 结果日志里出现大段堆栈，容易误判为本地网关问题
+   - 处理：
+     - 保留一次轻量重试
+     - 重试后仍失败时继续返回 `502`
+     - 响应错误类型改为：
+       - `type=upstream_error`
+       - `code=upstream_fetch_failed`
+     - 日志改为摘要：
+       - `[upstream-error] fetch failed after retry path=... message=fetch failed`
+     - 其他未知错误仍继续记录 `[error]` 堆栈
+   - 验证：
+     - `node .\scripts\test-gateway-e2e.mjs`
+       - 新增连续上游 fetch failed 返回 `upstream_error` 断言
+       - 新增日志不包含 `[error] TypeError: fetch failed` 断言
+
+32. 管理页运行状态移除旧 516 专属卡片，改为实际拦截口径
+   - 现象：
+     - 用户希望删除 `516 命中次数`
+     - `当前规则命中总数` 放到原 `516 命中次数` 位置
+     - `516 占比` 改为 `实际拦截占比`
+     - `实际拦截总数` 放到原 `516 占比` 位置
+   - 根因：
+     - 拦截目标拆成流式 / 非流式后，`516` 专属统计不再是管理页最核心口径
+     - 用户真正关心的是当前规则命中、实际拦截总数和实际拦截占比
+   - 处理：
+     - 管理页移除 `516 命中次数` 与 `516 占比` 卡片
+     - 运行状态卡片顺序调整为：
+       - 当前规则命中总数
+       - 实际拦截总数
+       - 实际拦截占比
+     - `实际拦截占比 = blocked_response_count / inspected_response_count`
+   - 验证：
+     - `node .\scripts\test-gateway-e2e.mjs`
+     - `node .\scripts\test-install-restore.mjs`
 
 ### 2026-06-26 实测证据
 
